@@ -2,28 +2,57 @@
 # Blink
 from scipy.spatial import distance as dist
 from multiprocessing import Process, Queue
+import matplotlib.animation as animation
+from matplotlib.lines import Line2D
 import matplotlib.pyplot as plt
+from collections import deque
 from imutils import face_utils
 from enum import Enum
 import imutils
 import dlib
 import cv2
 
+EYE_AR_THRESH = 0.3
+
 class InputEvents(Enum):
     click = 1
     option = 2
     close = 3
 
-class Blink:
-    # define two constants, one for the eye aspect ratio to indicate
-    # blink and then a second constant for the number of consecutive
-    # frames the eye must be below the threshold
-    EYE_AR_THRESH = 0.3
-
-    def __init__(self, queue, show=False):
-        self.show = show
-        self.run = True
+class BlinkPlot:
+    def __init__(self, queue, fps=30):
         self.queue = queue
+        self.fps = fps
+
+        self.cbuf = deque(maxlen=int(10*fps))
+        for i in range(self.cbuf.maxlen):
+            self.cbuf.append(EYE_AR_THRESH)
+
+        self.fig, self.ax = plt.subplots()
+        self.ax.grid()
+        self.ax.set_ylim(auto=True)
+        self.ax.axhline(EYE_AR_THRESH, color='r')
+        self.line, = self.ax.plot(self.cbuf)
+
+    def animate(self, i):
+        while not self.queue.empty():
+            self.cbuf.append(self.queue.get())
+
+        self.line.set_ydata(self.cbuf)
+        self.ax.relim()
+        self.ax.autoscale_view()
+        return self.line,
+
+    def start_plot(self):
+        ani = animation.FuncAnimation(self.fig, self.animate, interval=round((1/self.fps)*1000))
+        plt.show()
+
+class Blink:
+    def __init__(self, queues, show=False, plot=False):
+        self.show = show
+        self.plot = plot
+        self.run = True
+        self.queues = queues
 
         # initialize dlib's face detector (HOG-based) and then create
         # the facial landmark predictor
@@ -105,26 +134,12 @@ class Blink:
                     cv2.drawContours(frame, [leftEyeHull], -1, (0, 255, 0), 1)
                     cv2.drawContours(frame, [rightEyeHull], -1, (0, 255, 0), 1)
 
-                # check to see if the eye aspect ratio is below the blink
-                # threshold
-                if ear < self.EYE_AR_THRESH:
-                    blink = True
-                else:
-                    blink = False
-
-                plot.append(ear)
-                if (len(plot) == 500):
-                    plt.plot(plot)
-                    plt.show()
-
-                #print("blink = {}, ear = {}".format(blink, ear))
-                self.queue.put(blink)
+                for queue in self.queues:
+                    queue.put(ear)
 
                 if self.show:
                     # draw the total number of blinks on the frame along with
                     # the computed eye aspect ratio for the frame
-                    cv2.putText(frame, "Blink: {}".format(blink), (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                     cv2.putText(frame, "EAR: {:.2f}".format(ear), (300, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
@@ -142,6 +157,7 @@ class Blink:
 # An option is a double BLINK_TIME event
 # A close event is a full window with closed eyes
 class EventFilter:
+
     def __init__(self, queue, fps=30):
         self.WINDOW_SIZE = fps
         self.BLINK_TIME = round(fps * 0.2)
@@ -186,7 +202,15 @@ class EventFilter:
 
     def start(self):
         while True:
-            blink = self.in_queue.get()
+            ear = self.in_queue.get()
+
+            # check to see if the eye aspect ratio is below the blink
+            # threshold
+            if ear < EYE_AR_THRESH:
+                blink = True
+            else:
+                blink = False
+
             if self.window_pointer >= self.WINDOW_SIZE:
                 self.window_pointer = 0
 
@@ -207,17 +231,21 @@ def run():
         input_event = event.get_input()
         print("Input Event: {}".format(input_event))
 
-
-blink_queue = Queue()
-blink = Blink(blink_queue, True)
-event = EventFilter(blink_queue)
+processing_queue = Queue()
+plot_queue = Queue()
+blink = Blink((processing_queue, plot_queue), True)
+event = EventFilter(processing_queue)
+plot = BlinkPlot(plot_queue, blink.FRAME_RATE)
 
 b = Process(target=blink.start)
 e = Process(target=event.start)
+p = Process(target=plot.start_plot)
 m = Process(target=run)
 b.start()
+p.start()
 e.start()
 m.start()
 b.join()
+p.join()
 e.join()
 m.join()
