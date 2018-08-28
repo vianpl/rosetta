@@ -23,7 +23,10 @@ class Pad:
         self.direction = direction
 
     def chain(self, data):
-        self.queue.put(data)
+        try:
+            self.queue.put_nowait(data)
+        except:
+            return
 
     def get(self):
         return self.queue.get()
@@ -103,16 +106,18 @@ class Pipeline:
     def __init__(self):
         self.elements = []
 
-    def link_elements(self, source, sink):
-        queue = Queue()
-        source.set_pad(Direction.OUT, queue)
-        sink.set_pad(Direction.IN, queue)
+    def link_elements(self, sources, sinks, queue_size=0):
+        queue = Queue(queue_size)
 
-        # Save elements if needed
-        if not any(elem is source for elem in self.elements):
-            self.elements.append(source)
-        if not any(elem is sink for elem in self.elements):
-            self.elements.append(sink)
+        for source in sources:
+            source.set_pad(Direction.OUT, queue)
+            if not any(elem is source for elem in self.elements):
+                self.elements.append(source)
+
+        for sink in sinks:
+            sink.set_pad(Direction.IN, queue)
+            if not any(elem is sink for elem in self.elements):
+                self.elements.append(sink)
 
     def start(self):
         for elem in self.elements:
