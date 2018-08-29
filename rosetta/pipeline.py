@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # Blink
 # TODO: add exceptions...
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Value, Pipe, Lock
+from multiprocessing.connection import wait, Connection
 from enum import Enum
 
 class ElementType(Enum):
@@ -17,51 +18,42 @@ class PipelineStatus(Enum):
     STOP = 1
     PLAY = 2
 
-class Pad:
-    def __init__(self, queue, direction):
-        self.queue = queue
-        self.direction = direction
+class Pad(Connection):
+    @classmethod
+    def cast(cls, conn: Connection, name, direction, source_name, sink_name, lock, size=0):
+       conn.__class__ = cls
+       conn.name = name
+       conn.direction = direction
+       conn.source_name = source_name
+       conn.sink_name = sink_name
+       conn.lock = lock
+       conn.size = size
+       return conn
 
-    def chain(self, data):
-        try:
-            self.queue.put_nowait(data)
-        except:
-            return
+    def send(self, data):
+        with self.lock:
+            Connection.send(self, data)
 
-    def get(self):
-        return self.queue.get()
+    def recv(self):
+        with self.lock:
+            data = Connection.recv(self)
+
+        return data
 
 class Element(Process):
     def __init__(self, name, type):
         Process.__init__(self, name=name)
         self.type = type
-        self.in_pad = None
+        self.in_pads = []
         self.out_pads = []
 
-    def set_pad(self, direction, queue):
-        pad = Pad(queue, direction)
-        if direction is Direction.IN:
-            if self.in_pad is None:
-                self.in_pad = pad
-            else:
-                print("Failed to add pad, {} already has an in pad".format(self.name))
-        elif direction is Direction.OUT:
+    def add_pad(self, pad):
+        if pad.direction is Direction.IN:
+            self.in_pads.append(pad)
+        elif pad.direction is Direction.OUT:
             self.out_pads.append(pad)
         else:
             print("Failed to add pad, wrong direction")
-
-    def chain(self, data):
-        if not self.out_pads:
-            print("Can't chain {}, no pads".format(self.name))
-
-        for pad in self.out_pads:
-            pad.chain(data)
-
-    def get(self):
-        if self.in_pad is None:
-            print("Can't get data from {}, no in pads".format(self.name))
-
-        return self.in_pad.get()
 
     def consume(self, data):
         return NotImplemented
@@ -70,26 +62,33 @@ class Element(Process):
     def cleanup(self):
         pass
 
+    # optional
     def prepare(self):
         pass
 
     def run(self):
-        data = None
 
         self.prepare()
         while self.status is PipelineStatus.PLAY:
+            data = {}
+
+            # Get data if relevant
             if self.type is not ElementType.SOURCE:
-                data = self.in_pad.get()
+                for pad in wait(self.in_pads):
+                    pad_data = pad.recv()
+                    data[pad.name] = pad_data
 
-            #print("consume in {}".format(self.name))
-            data = self.consume(data)
-            #print("consume out {}, data {}".format(self.name, data))
+            # Send it to children element
+            if len(self.in_pads) == 1:
+                data = self.consume(data[self.in_pads[0].name])
+            else:
+                data = self.consume(data)
 
+            # Chain it to the next element if relevant
             if self.type is not ElementType.SINK and data is not None:
                 for pad in self.out_pads:
-                    pad.chain(data)
-
-        print("out {}".format(self.name))
+                    if pad.name in data:
+                        pad.send(data[pad.name])
 
         self.cleanup()
 
@@ -106,16 +105,20 @@ class Pipeline:
     def __init__(self):
         self.elements = []
 
-    def link_elements(self, sources, sinks, queue_size=0):
-        queue = Queue(queue_size)
+    def link(self, sources, sinks, source_pad_name=None, sink_pad_name=None, queue_size=0):
+        r, w = Pipe(duplex=False)
+        send_lock = Lock()
+        recv_lock = Lock()
+        r = Pad.cast(r, sink_pad_name, Direction.IN, sources[0].name, sinks[0].name, recv_lock)
+        w = Pad.cast(w, source_pad_name, Direction.OUT, sources[0].name, sinks[0].name, send_lock)
 
         for source in sources:
-            source.set_pad(Direction.OUT, queue)
+            source.add_pad(w)
             if not any(elem is source for elem in self.elements):
                 self.elements.append(source)
 
         for sink in sinks:
-            sink.set_pad(Direction.IN, queue)
+            sink.add_pad(r)
             if not any(elem is sink for elem in self.elements):
                 self.elements.append(sink)
 

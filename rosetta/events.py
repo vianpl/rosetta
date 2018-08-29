@@ -17,6 +17,7 @@ import sys
 import cv2
 
 EYE_AR_THRESH = 0.3
+FPS = 30
 
 # grab the indexes of the facial landmarks for the left and
 # right eye, respectively
@@ -33,18 +34,27 @@ class Camera(Element):
         Element.__init__(self, name, ElementType.SOURCE)
 
         # start the video stream thread
-        self.vs = cv2.VideoCapture(0)
-        self.FRAME_RATE = self.vs.get(cv2.CAP_PROP_FPS)
+        self.vs = cv2.VideoCapture(1)
+        self.camera_fps = self.vs.get(cv2.CAP_PROP_FPS)
+        self.count = 0
+        self.drop_rate = round(self.camera_fps / FPS)
 
     def consume(self, data):
+        out = None
+
         # grab the frame from the threaded video file stream, resize
         # it, and convert it to grayscale
         ret, frame = self.vs.read()
         if ret != True:
             print("frame grab error {}:".format(ret))
-            return None
 
-        return frame
+        if ret and not (self.count % self.drop_rate):
+            # TODO: Find a way to make this more clean
+            out = {None: frame}
+
+        self.count += 1
+
+        return out
 
 
 class BlinkDetector(Element):
@@ -101,7 +111,8 @@ class BlinkDetector(Element):
 
         ear = self.eye_aspect_ratio(shape)
 
-        out = {"frame": frame, "shape": shape, "ear": ear}
+        out_data = {"frame": frame, "shape": shape, "ear": ear}
+        out = {None: out_data}
         return out
 
     def cleanup(self):
@@ -135,14 +146,13 @@ class CameraPlot(Element):
         self.vs.stop()
 
 class BlinkPlot(Element):
-    def __init__(self, name, fps=30):
+    def __init__(self, name):
         Element.__init__(self, name, ElementType.SINK)
-        self.fps = fps
 
     def prepare(self):
         # Create 10s window buffer. It moves along with the incoming
         # data
-        self.cbuf = deque(maxlen=int(10*self.fps))
+        self.cbuf = deque(maxlen=int(10 * FPS))
         for i in range(self.cbuf.maxlen):
             self.cbuf.append(EYE_AR_THRESH)
 
@@ -179,18 +189,14 @@ class BlinkPlot(Element):
         self.p.join()
 
 class InputEventFilter(Element):
-    def __init__(self, name, fps=30):
+    def __init__(self, name):
         Element.__init__(self, name, ElementType.PROCESSING)
-        self.fps = fps
 
     def prepare(self):
-        self.TIMEOUT_MS = 600
-        self.FALSE_POSITIVE_MS = 300
-        self.num_planes_timeout = round(self.TIMEOUT_MS / (1000 / self.fps))
-        self.num_planes_false_positive = round(self.FALSE_POSITIVE_MS / (1000 / self.fps))
-        print("timeout {}, false_positive {}".format(self.num_planes_timeout, self.num_planes_false_positive))
+        self.BLINK_TICK_MS = 400
+        self.num_planes_timeout = round(self.BLINK_TICK_MS / (1000 / FPS))
+        self.tick_count = 0
         self.count = 0
-        self.timeout_count = 0
 
     def consume(self, data):
         ear = data["ear"]
@@ -209,24 +215,24 @@ class InputEventFilter(Element):
 
         if self.count and blink:
             self.count += 1
-            if self.count > self.num_planes_timeout and not self.timeout_count:
-                self.timeout_count += 1
-                out = {"input_event": None, "beep": "tap"}
-                print("beep! {}, {}".format(self.count, self.timeout_count))
+            if not (self.count % self.num_planes_timeout) and self.tick_count < 2:
+                self.tick_count += 1
+                print("beep! {}, {}".format(self.count, self.tick_count))
+                out = {"beeps": "tap"}
             return out
 
 
         if self.count and not blink:
-            if self.count > self.num_planes_false_positive:
-                if not self.timeout_count:
-                    out = {"input_event": InputEvents.SKIP, "beep": "click"}
-                    print("click! {}, {}".format(self.count, self.timeout_count))
-                elif self.timeout_count:
-                    out = {"input_event": InputEvents.ENTER, "beep": "click"}
-                    print("click! {}, {}".format(self.count, self.timeout_count))
+            if self.tick_count:
+                if self.tick_count == 1:
+                    print("click! {}, {}".format(self.count, self.tick_count))
+                    out = {"input_events": InputEvents.SKIP, "beeps": "click"}
+                elif self.tick_count > 1:
+                    print("click! {}, {}".format(self.count, self.tick_count))
+                    out = {"input_events": InputEvents.ENTER, "beeps": "click"}
 
         self.count = 0
-        self.timeout_count = 0
+        self.tick_count = 0
         return out
 
 class Beeper(Element):
@@ -253,9 +259,9 @@ class Beeper(Element):
         wave.rewind()
 
     def consume(self, data):
-        if data["beep"] == "tap":
+        if data == "tap":
             self.play(self.tap)
-        elif data["beep"] == "click":
+        elif data == "click":
             self.play(self.click)
 
     def cleanup(self):
@@ -278,12 +284,9 @@ class Main(Element):
         self.sp.set_voice("spanish")
 
     def consume(self, data):
-        if data["input_event"]:
-            print("Input Event! {}".format(data["input_event"]))
-
-        if data["input_event"] == InputEvents.SKIP:
+        if data == InputEvents.SKIP:
             self.sp.synth("si")
-        elif data["input_event"] == InputEvents.ENTER:
+        elif data == InputEvents.ENTER:
             self.sp.synth("no")
 
 def sigint_handler(signum, frame):
@@ -295,16 +298,16 @@ signal.signal(signal.SIGINT, sigint_handler)
 pipe = Pipeline()
 camera = [Camera("camera")]
 blink = [BlinkDetector("blink_detector") for x in range(4)]
-plot = [BlinkPlot("blink_plot", camera[0].FRAME_RATE)]
+plot = [BlinkPlot("blink_plot")]
 camera_plot = [CameraPlot("camera_plot")]
-event = [InputEventFilter("input_event_filter")]
+input_filter = [InputEventFilter("input_event_filter")]
 beeper = [Beeper("beeper")]
 main = [Main("main")]
-pipe.link_elements(camera, blink, 1)
-pipe.link_elements(blink, plot)
-pipe.link_elements(blink, camera_plot)
-pipe.link_elements(blink, event)
-pipe.link_elements(event, beeper)
-pipe.link_elements(event, main)
+pipe.link(camera, blink, queue_size=1)
+pipe.link(blink, plot)
+pipe.link(blink, camera_plot)
+pipe.link(blink, input_filter)
+pipe.link(input_filter, beeper, source_pad_name="beeps")
+pipe.link(input_filter, main, source_pad_name="input_events")
 pipe.start()
 
